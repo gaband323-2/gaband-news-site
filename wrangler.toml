@@ -1,0 +1,30 @@
+name = "gaband-news-site"
+main = "src/index.js"
+compatibility_date = "2026-04-26"
+workers_dev = false
+
+routes = [
+  { pattern = "news.gaband323.dev", custom_domain = true }
+]
+
+[observability]
+enabled = true
+
+[vars]
+SITE_NAME = "Gaband News"
+SITE_ORIGIN = "https://news.gaband323.dev"
+NEWS_COUNTRY = "us"
+NEWS_LANG = "en"
+ADMIN_EMAILS = "your-email@example.com"
+EMAIL_FROM = "Gaband News <updates@news.gaband323.dev>"
+DIGEST_SUBJECT = "Your Gaband News update"
+FETCH_CATEGORIES = "general,business,technology,entertainment,health,science,sports"
+TRENDING_QUERIES = "AI,Cloudflare,Roblox,Discord,Los Angeles,transportation"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "gaband-news-db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[triggers]
+crons = ["*/30 * * * *", "0 14 * * *"]

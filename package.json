@@ -1,0 +1,17 @@
+{
+  "name": "gaband-news-site",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create gaband-news-db",
+    "db:migrate:local": "wrangler d1 migrations apply gaband-news-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply gaband-news-db --remote",
+    "seed": "wrangler d1 execute gaband-news-db --file=./migrations/0001_init.sql --remote"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}
