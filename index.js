@@ -14,11 +14,15 @@ export default {
 
       if (path === "/") return home(request, env);
       if (path === "/health") return json({ ok: true });
+      if (path === "/api/articles") return apiArticles(request, env);
+      if (path === "/api/news/sync") return apiSync(request, env);
+
       if (path === "/login") return login(request, env);
       if (path === "/signup") return signup(request, env);
       if (path === "/logout") return logout(request, env);
       if (path === "/settings") return settings(request, env);
       if (path === "/subscribe") return subscribe(request, env);
+
       if (path === "/article") return article(request, env);
       if (path === "/comment/add") return addComment(request, env);
       if (path === "/comment/delete") return deleteComment(request, env);
@@ -33,6 +37,7 @@ export default {
       return page("Not found", "<h1>404</h1><p>That page does not exist.</p>", env, 404);
     } catch (err) {
       console.error(err);
+
       return page(
         "Error",
         `<h1>Something broke</h1><p class="error">${esc(err.message || String(err))}</p><pre>${esc(err.stack || "")}</pre>`,
@@ -103,6 +108,8 @@ async function ensureDatabase(env) {
   `).run();
 
   await env.DB.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_url ON articles(url)`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles(published_at)`).run();
 
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS comments (
@@ -212,9 +219,9 @@ async function home(request, env) {
   return page("Home", `
     <section class="hero">
       <h1>${esc(siteName(env))}</h1>
-      <p>Auto-updating news from NewsData.io. Readers can create accounts and comment on stories.</p>
+      <p>Auto-updating news powered by Gaband323’s built-in Google News RSS API.</p>
       <p>
-        <a class="button" href="/admin">Admin</a>
+        ${env.__viewer?.role === "admin" ? `<a class="button" href="/admin">Admin</a>` : ""}
         ${env.__viewer ? `<a class="button secondary" href="/settings">Settings</a>` : `<a class="button secondary" href="/signup">Create account</a>`}
         <a class="button secondary" href="/subscribe">Subscribe</a>
       </p>
@@ -286,7 +293,7 @@ async function article(request, env) {
       <h1>${esc(a.title)}</h1>
       ${a.image_url ? `<img src="${esc(a.image_url)}" alt="">` : ""}
       <p>${esc(a.description || "")}</p>
-      <div>${paragraphs(a.content || a.description || "No full content was provided by the API.")}</div>
+      <div>${paragraphs(a.content || a.description || "No full content was provided by the source feed. Open the original source for the full story.")}</div>
       ${a.url ? `<p><a class="button" href="${esc(a.url)}" target="_blank" rel="noopener noreferrer">Open original source</a></p>` : ""}
     </article>
 
@@ -304,6 +311,7 @@ async function addComment(request, env) {
   if (!me) return redirect("/login");
 
   const settings = await getUserSettings(env, me.id, me.email);
+
   if (Number(settings.can_comment) !== 1) {
     return page(
       "Comment blocked",
@@ -380,6 +388,8 @@ function loginForm(error) {
 }
 
 async function signup(request, env) {
+  if (env.__viewer) return redirect("/settings");
+
   if (request.method === "POST") {
     const form = await request.formData();
     const email = String(form.get("email") || "").trim().toLowerCase();
@@ -477,6 +487,7 @@ async function settings(request, env) {
 
 async function logout(request, env) {
   const sid = getCookie(request, COOKIE_NAME);
+
   if (sid) await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(sid).run();
 
   return redirect("/", {
@@ -565,7 +576,7 @@ async function admin(request, env) {
     <section class="panel">
       <h2>Sync news</h2>
       <form method="POST" action="/admin/sync">
-        <button>Sync NewsData.io now</button>
+        <button>Sync Google News RSS now</button>
       </form>
     </section>
 
@@ -740,41 +751,46 @@ function subscribeForm(error) {
 }
 
 async function runNewsSync(env) {
-  if (!env.NEWS_API_KEY) return { ok: false, error: "Missing NEWS_API_KEY secret." };
-
-  const categories = splitEnv(env.FETCH_CATEGORIES || CATEGORIES.join(","));
-  const map = {
-    general: "top",
-    business: "business",
-    technology: "technology",
-    entertainment: "entertainment",
-    health: "health",
-    science: "science",
-    sports: "sports"
+  const categoryQueries = {
+    general: "top stories",
+    business: "business news",
+    technology: "technology news",
+    entertainment: "entertainment news",
+    health: "health news",
+    science: "science news",
+    sports: "sports news"
   };
+
+  const categories = splitEnv(env.FETCH_CATEGORIES || CATEGORIES.join(","))
+    .map(cleanCategory)
+    .filter(c => c !== "all");
 
   let inserted = 0;
   let updated = 0;
   const failed = [];
 
-  for (const categoryRaw of categories) {
-    const category = cleanCategory(categoryRaw);
-    const endpoint = new URL("https://newsdata.io/api/1/latest");
+  for (const category of categories) {
+    const query = categoryQueries[category] || "top stories";
+    const endpoint = new URL("https://news.google.com/rss/search");
 
-    endpoint.searchParams.set("apikey", env.NEWS_API_KEY);
-    endpoint.searchParams.set("country", env.NEWS_COUNTRY || "us");
-    endpoint.searchParams.set("language", env.NEWS_LANG || "en");
-    endpoint.searchParams.set("category", map[category] || "top");
+    endpoint.searchParams.set("q", query);
+    endpoint.searchParams.set("hl", "en-US");
+    endpoint.searchParams.set("gl", "US");
+    endpoint.searchParams.set("ceid", "US:en");
 
     try {
-      const res = await fetch(endpoint.toString());
-      const data = await res.json();
+      const res = await fetch(endpoint.toString(), {
+        headers: {
+          "User-Agent": "Gaband323News/1.0"
+        }
+      });
 
-      if (!res.ok || (data.status && data.status !== "success")) {
-        throw new Error(data.message || `HTTP ${res.status}`);
-      }
+      if (!res.ok) throw new Error(`Google News RSS HTTP ${res.status}`);
 
-      for (const item of data.results || []) {
+      const xml = await res.text();
+      const items = parseRssItems(xml).slice(0, 25);
+
+      for (const item of items) {
         const result = await saveNewsItem(env, item, category);
 
         if (result === "inserted") inserted++;
@@ -787,7 +803,7 @@ async function runNewsSync(env) {
 
   return {
     ok: failed.length === 0,
-    provider: "newsdata.io",
+    provider: "google_news_rss",
     inserted,
     updated,
     failed
@@ -796,12 +812,16 @@ async function runNewsSync(env) {
 
 async function saveNewsItem(env, item, category) {
   const title = item.title || "";
-  const url = item.link || item.url || "";
+  const url = item.link || "";
 
   if (!title || !url) return "skipped";
 
   const existing = await env.DB.prepare(`SELECT id FROM articles WHERE url = ?`).bind(url).first();
   const id = existing?.id || crypto.randomUUID();
+
+  const description = item.description || "";
+  const sourceName = item.source || "Google News";
+  const publishedAt = item.pubDate || new Date().toISOString();
 
   await env.DB.prepare(`
     INSERT INTO articles (
@@ -813,26 +833,124 @@ async function saveNewsItem(env, item, category) {
       title = excluded.title,
       description = excluded.description,
       content = excluded.content,
-      image_url = excluded.image_url,
       source_name = excluded.source_name,
-      author = excluded.author,
       category = excluded.category,
       published_at = excluded.published_at
   `).bind(
     id,
     title,
-    item.description || item.content || "",
-    item.content || item.description || "",
+    description,
+    description,
     url,
-    item.image_url || "",
-    item.source_name || item.source_id || "NewsData.io",
-    Array.isArray(item.creator) ? item.creator.join(", ") : item.creator || "",
+    "",
+    sourceName,
+    "",
     cleanCategory(category),
     "",
-    item.pubDate || new Date().toISOString()
+    publishedAt
   ).run();
 
   return existing ? "updated" : "inserted";
+}
+
+function parseRssItems(xml) {
+  const matches = String(xml || "").match(/<item>[\s\S]*?<\/item>/g) || [];
+
+  return matches.map(raw => {
+    const title = decodeHtml(stripCdata(getXmlTag(raw, "title")));
+    const link = decodeHtml(stripCdata(getXmlTag(raw, "link")));
+    const pubDateRaw = decodeHtml(stripCdata(getXmlTag(raw, "pubDate")));
+    const descriptionRaw = decodeHtml(stripCdata(getXmlTag(raw, "description")));
+    const source = decodeHtml(stripCdata(getXmlTag(raw, "source")));
+
+    const pubDate = (() => {
+      const d = new Date(pubDateRaw);
+      return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+    })();
+
+    return {
+      title: cleanGoogleNewsTitle(title),
+      link,
+      description: cleanDescription(descriptionRaw),
+      source: source || guessSourceFromTitle(title),
+      pubDate
+    };
+  }).filter(item => item.title && item.link);
+}
+
+function getXmlTag(xml, tag) {
+  const match = String(xml || "").match(new RegExp(`<${tag}(?: [^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"));
+  return match ? match[1] : "";
+}
+
+function stripCdata(value) {
+  return String(value || "")
+    .replace(/^<!\[CDATA\[/, "")
+    .replace(/\]\]>$/, "")
+    .trim();
+}
+
+function decodeHtml(value) {
+  return String(value || "")
+    .replaceAll("&amp;", "&")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&quot;", '"')
+    .replaceAll("&#39;", "'")
+    .replaceAll("&#039;", "'")
+    .replaceAll("&apos;", "'");
+}
+
+function cleanDescription(value) {
+  return String(value || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 600);
+}
+
+function cleanGoogleNewsTitle(title) {
+  return String(title || "")
+    .replace(/\s+-\s+[^-]{2,100}$/, "")
+    .trim();
+}
+
+function guessSourceFromTitle(title) {
+  const parts = String(title || "").split(" - ");
+  return parts.length > 1 ? parts[parts.length - 1].trim() : "Google News";
+}
+
+async function apiArticles(request, env) {
+  const url = new URL(request.url);
+  const category = cleanCategory(url.searchParams.get("category") || "general");
+
+  let q = `SELECT * FROM articles`;
+  const params = [];
+
+  if (category && category !== "all") {
+    q += ` WHERE category = ?`;
+    params.push(category);
+  }
+
+  q += ` ORDER BY COALESCE(published_at, created_at) DESC LIMIT 50`;
+
+  const result = await env.DB.prepare(q).bind(...params).all();
+
+  return json({
+    ok: true,
+    provider: "gaband323_news_api",
+    articles: result.results || []
+  });
+}
+
+async function apiSync(request, env) {
+  const user = await requireAdmin(request, env);
+
+  if (user instanceof Response) return json({ ok: false, error: "Unauthorized" }, 401);
+
+  const result = await runNewsSync(env);
+
+  return json(result);
 }
 
 async function requireAdmin(request, env) {
@@ -899,7 +1017,9 @@ async function verifyPassword(password, stored) {
 }
 
 function hex(buffer) {
-  return [...new Uint8Array(buffer)].map(x => x.toString(16).padStart(2, "0")).join("");
+  return [...new Uint8Array(buffer)]
+    .map(x => x.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 function page(title, body, env, status = 200) {
@@ -955,6 +1075,7 @@ function page(title, body, env, status = 200) {
     th,td{border-bottom:1px solid #27272a;padding:10px;text-align:left;vertical-align:top}
     pre{white-space:pre-wrap;background:#050507;border:1px solid #27272a;border-radius:12px;padding:12px;overflow:auto}
     hr{border:0;border-top:1px solid #27272a;margin:18px 0}
+    @media(max-width:700px){header{align-items:flex-start;gap:10px;flex-direction:column}.wrap{padding:20px 14px}}
   </style>
 </head>
 <body>
@@ -1065,4 +1186,4 @@ function esc(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-}
+                                             }
