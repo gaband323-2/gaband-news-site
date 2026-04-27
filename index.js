@@ -7,6 +7,8 @@ export default {
       await ensureDatabase(env);
       await ensurePresetAdmin(env);
 
+      env.__viewer = await currentUser(request, env).catch(() => null);
+
       const url = new URL(request.url);
       const path = url.pathname;
 
@@ -213,7 +215,7 @@ async function home(request, env) {
       <p>Auto-updating news from NewsData.io. Readers can create accounts and comment on stories.</p>
       <p>
         <a class="button" href="/admin">Admin</a>
-        <a class="button secondary" href="/signup">Create account</a>
+        ${env.__viewer ? `<a class="button secondary" href="/settings">Settings</a>` : `<a class="button secondary" href="/signup">Create account</a>`}
         <a class="button secondary" href="/subscribe">Subscribe</a>
       </p>
     </section>
@@ -783,7 +785,13 @@ async function runNewsSync(env) {
     }
   }
 
-  return { ok: failed.length === 0, inserted, updated, failed };
+  return {
+    ok: failed.length === 0,
+    provider: "newsdata.io",
+    inserted,
+    updated,
+    failed
+  };
 }
 
 async function saveNewsItem(env, item, category) {
@@ -819,7 +827,7 @@ async function saveNewsItem(env, item, category) {
     item.image_url || "",
     item.source_name || item.source_id || "NewsData.io",
     Array.isArray(item.creator) ? item.creator.join(", ") : item.creator || "",
-    category,
+    cleanCategory(category),
     "",
     item.pubDate || new Date().toISOString()
   ).run();
@@ -895,6 +903,18 @@ function hex(buffer) {
 }
 
 function page(title, body, env, status = 200) {
+  const viewer = env.__viewer;
+
+  const nav = `
+    <nav>
+      <a href="/">News</a>
+      ${viewer ? `<a href="/settings">Settings</a>` : `<a href="/signup">Sign up</a>`}
+      <a href="/subscribe">Subscribe</a>
+      ${viewer?.role === "admin" ? `<a href="/admin">Admin</a>` : ""}
+      ${viewer ? `<a href="/logout">Logout</a>` : `<a href="/login">Login</a>`}
+    </nav>
+  `;
+
   const html = `<!doctype html>
 <html>
 <head>
@@ -940,13 +960,7 @@ function page(title, body, env, status = 200) {
 <body>
   <header>
     <a href="/"><b>G</b> ${esc(siteName(env))}</a>
-    <nav>
-      <a href="/">News</a>
-      <a href="/signup">Sign up</a>
-      <a href="/settings">Settings</a>
-      <a href="/subscribe">Subscribe</a>
-      <a href="/admin">Admin</a>
-    </nav>
+    ${nav}
   </header>
 
   <main class="wrap">${body}</main>
