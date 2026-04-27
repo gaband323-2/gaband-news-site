@@ -13,6 +13,7 @@ const COOKIE_NAME = "gaband323_news_session";
 export default {
   async fetch(request, env, ctx) {
     try {
+      await ensureDatabase(env);
       await ensurePresetAdmin(env);
 
       const url = new URL(request.url);
@@ -38,12 +39,17 @@ export default {
       if (path === "/subscribe") return subscribePage(request, env);
       if (path === "/api/news/sync") return apiSync(request, env);
       if (path === "/api/articles") return apiArticles(request, env);
+      if (path === "/health") return json({ ok: true, site: siteName(env) });
 
-      return htmlPage("Not Found", `<h1>404</h1><p>That page does not exist.</p>`, env, 404);
+      return htmlPage("Not Found", "<h1>404</h1><p>That page does not exist.</p>", env, 404);
     } catch (err) {
+      console.error("Worker error:", err && err.stack ? err.stack : err);
+
       return htmlPage(
         "Error",
-        `<h1>Something broke</h1><pre>${escapeHtml(err.stack || err.message || String(err))}</pre>`,
+        `<h1>Something broke</h1>
+         <p class="error">${escapeHtml(err.message || String(err))}</p>
+         <pre>${escapeHtml(err.stack || "")}</pre>`,
         env,
         500
       );
@@ -55,7 +61,92 @@ export default {
   }
 };
 
+async function ensureDatabase(env) {
+  if (!env.DB) throw new Error("Missing D1 binding named DB.");
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'user',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS articles (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      description TEXT,
+      content TEXT,
+      url TEXT,
+      image_url TEXT,
+      source_name TEXT,
+      author TEXT,
+      category TEXT NOT NULL DEFAULT 'general',
+      topic TEXT,
+      published_at TEXT,
+      is_manual INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_url ON articles(url)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_articles_published_at ON articles(published_at)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      categories TEXT NOT NULL DEFAULT 'general,technology,business,science,health,sports,entertainment',
+      verified INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS login_codes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      is_admin INTEGER NOT NULL DEFAULT 0,
+      max_uses INTEGER NOT NULL DEFAULT 1,
+      uses INTEGER NOT NULL DEFAULT 0,
+      expires_at TEXT,
+      created_by TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+}
+
 async function runScheduled(event, env) {
+  await ensureDatabase(env);
   await ensurePresetAdmin(env);
 
   if (event.cron && event.cron.includes("0 14")) {
@@ -71,25 +162,21 @@ async function homePage(request, env) {
   const category = cleanCategory(url.searchParams.get("category") || "general");
   const q = (url.searchParams.get("q") || "").trim();
 
-  let sql = `
-    SELECT *
-    FROM articles
-    WHERE 1=1
-  `;
+  let sql = "SELECT * FROM articles WHERE 1=1";
   const params = [];
 
   if (category && category !== "all") {
-    sql += ` AND category = ?`;
+    sql += " AND category = ?";
     params.push(category);
   }
 
   if (q) {
-    sql += ` AND (title LIKE ? OR description LIKE ? OR topic LIKE ? OR source_name LIKE ?)`;
+    sql += " AND (title LIKE ? OR description LIKE ? OR topic LIKE ? OR source_name LIKE ?)";
     const like = `%${q}%`;
     params.push(like, like, like, like);
   }
 
-  sql += ` ORDER BY COALESCE(published_at, created_at) DESC LIMIT 60`;
+  sql += " ORDER BY COALESCE(published_at, created_at) DESC LIMIT 60";
 
   const articles = await env.DB.prepare(sql).bind(...params).all();
 
@@ -119,8 +206,8 @@ async function homePage(request, env) {
     </section>
 
     <form class="searchbar" method="GET" action="/">
-      <input name="q" value="${escapeHtml(q)}" placeholder="Search articles, topics, sources..." />
-      <input type="hidden" name="category" value="${escapeHtml(category)}" />
+      <input name="q" value="${escapeAttr(q)}" placeholder="Search articles, topics, sources..." />
+      <input type="hidden" name="category" value="${escapeAttr(category)}" />
       <button>Search</button>
     </form>
 
@@ -158,10 +245,10 @@ function articleCard(article) {
 
 async function articlePage(request, env) {
   const id = decodeURIComponent(new URL(request.url).pathname.replace("/article/", ""));
-  const article = await env.DB.prepare(`SELECT * FROM articles WHERE id = ?`).bind(id).first();
+  const article = await env.DB.prepare("SELECT * FROM articles WHERE id = ?").bind(id).first();
 
   if (!article) {
-    return htmlPage("Article not found", `<h1>Article not found</h1><p>This article does not exist.</p>`, env, 404);
+    return htmlPage("Article not found", "<h1>Article not found</h1><p>This article does not exist.</p>", env, 404);
   }
 
   const image = article.image_url
@@ -190,7 +277,7 @@ async function loginPage(request, env) {
     const email = String(form.get("email") || "").trim().toLowerCase();
     const password = String(form.get("password") || "");
 
-    const user = await env.DB.prepare(`SELECT * FROM users WHERE email = ?`).bind(email).first();
+    const user = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
 
     if (!user) {
       return htmlPage("Login", loginForm("Invalid email or password."), env, 401);
@@ -220,6 +307,7 @@ function loginForm(error = "") {
         <button>Login</button>
       </form>
       <p><a href="/code-login">Use a login code instead</a></p>
+      <p><a href="/signup">Create an account</a></p>
     </section>
   `;
 }
@@ -239,10 +327,9 @@ async function signupPage(request, env) {
     const hash = await hashPassword(password);
 
     try {
-      await env.DB.prepare(`
-        INSERT INTO users (id, email, password_hash, role)
-        VALUES (?, ?, ?, ?)
-      `).bind(id, email, hash, role).run();
+      await env.DB.prepare("INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, ?)")
+        .bind(id, email, hash, role)
+        .run();
 
       return createSessionResponse(env, id, role === "admin" ? "/admin" : "/");
     } catch (e) {
@@ -275,10 +362,7 @@ async function codeLoginPage(request, env) {
     const form = await request.formData();
     const code = String(form.get("code") || "").trim();
 
-    const record = await env.DB.prepare(`
-      SELECT * FROM login_codes
-      WHERE code = ?
-    `).bind(code).first();
+    const record = await env.DB.prepare("SELECT * FROM login_codes WHERE code = ?").bind(code).first();
 
     if (!record) {
       return htmlPage("Code Login", codeLoginForm("Invalid code."), env, 401);
@@ -297,16 +381,13 @@ async function codeLoginPage(request, env) {
     const userId = crypto.randomUUID();
     const role = Number(record.is_admin) === 1 ? "admin" : "user";
 
-    await env.DB.prepare(`
-      INSERT INTO users (id, email, password_hash, role)
-      VALUES (?, ?, ?, ?)
-    `).bind(userId, email, passwordHash, role).run();
+    await env.DB.prepare("INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, ?)")
+      .bind(userId, email, passwordHash, role)
+      .run();
 
-    await env.DB.prepare(`
-      UPDATE login_codes
-      SET uses = uses + 1
-      WHERE id = ?
-    `).bind(record.id).run();
+    await env.DB.prepare("UPDATE login_codes SET uses = uses + 1 WHERE id = ?")
+      .bind(record.id)
+      .run();
 
     return createSessionResponse(env, userId, role === "admin" ? "/admin" : "/");
   }
@@ -333,7 +414,7 @@ async function logout(request, env) {
   const cookie = getCookie(request, COOKIE_NAME);
 
   if (cookie) {
-    await env.DB.prepare(`DELETE FROM sessions WHERE id = ?`).bind(cookie).run();
+    await env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(cookie).run();
   }
 
   return redirect("/", {
@@ -345,26 +426,9 @@ async function adminPage(request, env) {
   const user = await requireAdmin(request, env);
   if (user instanceof Response) return user;
 
-  const articles = await env.DB.prepare(`
-    SELECT *
-    FROM articles
-    ORDER BY COALESCE(published_at, created_at) DESC
-    LIMIT 40
-  `).all();
-
-  const users = await env.DB.prepare(`
-    SELECT id, email, role, created_at
-    FROM users
-    ORDER BY created_at DESC
-    LIMIT 100
-  `).all();
-
-  const codes = await env.DB.prepare(`
-    SELECT *
-    FROM login_codes
-    ORDER BY created_at DESC
-    LIMIT 100
-  `).all();
+  const articles = await env.DB.prepare("SELECT * FROM articles ORDER BY COALESCE(published_at, created_at) DESC LIMIT 40").all();
+  const users = await env.DB.prepare("SELECT id, email, role, created_at FROM users ORDER BY created_at DESC LIMIT 100").all();
+  const codes = await env.DB.prepare("SELECT * FROM login_codes ORDER BY created_at DESC LIMIT 100").all();
 
   return htmlPage("Admin", `
     <section class="admin-head">
@@ -376,6 +440,7 @@ async function adminPage(request, env) {
       <div class="hero-actions">
         <form method="POST" action="/admin/sync"><button>Sync news now</button></form>
         <form method="POST" action="/admin/digest"><button class="secondary">Send digest now</button></form>
+        <a class="button secondary" href="/logout">Logout</a>
       </div>
     </section>
 
@@ -542,7 +607,7 @@ async function adminSaveArticle(request, env) {
   };
 
   if (!article.title) {
-    return htmlPage("Missing title", `<h1>Missing title</h1><p>Article title is required.</p>`, env, 400);
+    return htmlPage("Missing title", "<h1>Missing title</h1><p>Article title is required.</p>", env, 400);
   }
 
   await env.DB.prepare(`
@@ -587,7 +652,7 @@ async function adminDeleteArticle(request, env) {
 
   const form = await request.formData();
   const id = String(form.get("id") || "");
-  await env.DB.prepare(`DELETE FROM articles WHERE id = ?`).bind(id).run();
+  await env.DB.prepare("DELETE FROM articles WHERE id = ?").bind(id).run();
 
   return redirect("/admin");
 }
@@ -603,33 +668,24 @@ async function adminSaveUser(request, env) {
 
   if (!email) return redirect("/admin");
 
-  const existing = await env.DB.prepare(`SELECT * FROM users WHERE email = ?`).bind(email).first();
+  const existing = await env.DB.prepare("SELECT * FROM users WHERE email = ?").bind(email).first();
 
   if (existing) {
     if (password) {
       const hash = await hashPassword(password);
-      await env.DB.prepare(`
-        UPDATE users
-        SET role = ?, password_hash = ?
-        WHERE email = ?
-      `).bind(role, hash, email).run();
+      await env.DB.prepare("UPDATE users SET role = ?, password_hash = ? WHERE email = ?").bind(role, hash, email).run();
     } else {
-      await env.DB.prepare(`
-        UPDATE users
-        SET role = ?
-        WHERE email = ?
-      `).bind(role, email).run();
+      await env.DB.prepare("UPDATE users SET role = ? WHERE email = ?").bind(role, email).run();
     }
   } else {
     if (!password || password.length < 8) {
-      return htmlPage("Password required", `<h1>Password required</h1><p>New users need an 8+ character password.</p><p><a href="/admin">Back</a></p>`, env, 400);
+      return htmlPage("Password required", "<h1>Password required</h1><p>New users need an 8+ character password.</p><p><a href=\"/admin\">Back</a></p>", env, 400);
     }
 
     const hash = await hashPassword(password);
-    await env.DB.prepare(`
-      INSERT INTO users (id, email, password_hash, role)
-      VALUES (?, ?, ?, ?)
-    `).bind(crypto.randomUUID(), email, hash, role).run();
+    await env.DB.prepare("INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, ?)")
+      .bind(crypto.randomUUID(), email, hash, role)
+      .run();
   }
 
   return redirect("/admin");
@@ -643,10 +699,10 @@ async function adminDeleteUser(request, env) {
   const id = String(form.get("id") || "");
 
   if (id === admin.id) {
-    return htmlPage("Cannot delete yourself", `<h1>Nope</h1><p>You cannot delete your own account while logged in.</p><p><a href="/admin">Back</a></p>`, env, 400);
+    return htmlPage("Cannot delete yourself", "<h1>Nope</h1><p>You cannot delete your own account while logged in.</p><p><a href=\"/admin\">Back</a></p>", env, 400);
   }
 
-  await env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(id).run();
+  await env.DB.prepare("DELETE FROM users WHERE id = ?").bind(id).run();
 
   return redirect("/admin");
 }
@@ -662,10 +718,9 @@ async function adminSaveCode(request, env) {
   const expiresRaw = String(form.get("expires_at") || "").trim();
   const expiresAt = expiresRaw ? new Date(expiresRaw).toISOString() : null;
 
-  await env.DB.prepare(`
-    INSERT INTO login_codes (code, is_admin, max_uses, expires_at, created_by)
-    VALUES (?, ?, ?, ?, ?)
-  `).bind(code, isAdmin, maxUses, expiresAt, user.id).run();
+  await env.DB.prepare("INSERT INTO login_codes (code, is_admin, max_uses, expires_at, created_by) VALUES (?, ?, ?, ?, ?)")
+    .bind(code, isAdmin, maxUses, expiresAt, user.id)
+    .run();
 
   return redirect("/admin");
 }
@@ -676,7 +731,7 @@ async function adminDeleteCode(request, env) {
 
   const form = await request.formData();
   const id = String(form.get("id") || "");
-  await env.DB.prepare(`DELETE FROM login_codes WHERE id = ?`).bind(id).run();
+  await env.DB.prepare("DELETE FROM login_codes WHERE id = ?").bind(id).run();
 
   return redirect("/admin");
 }
@@ -721,9 +776,7 @@ function subscribeForm(error = "") {
         <input name="email" type="email" required />
         <label>Categories</label>
         <div class="checks">
-          ${CATEGORIES.map(c => `
-            <label><input type="checkbox" name="categories" value="${c}" checked /> ${label(c)}</label>
-          `).join("")}
+          ${CATEGORIES.map(c => `<label><input type="checkbox" name="categories" value="${c}" checked /> ${label(c)}</label>`).join("")}
         </div>
         <button>Subscribe</button>
       </form>
@@ -743,18 +796,15 @@ async function apiArticles(request, env) {
   const url = new URL(request.url);
   const category = cleanCategory(url.searchParams.get("category") || "general");
 
-  let q = `
-    SELECT *
-    FROM articles
-  `;
+  let q = "SELECT * FROM articles";
   const params = [];
 
   if (category && category !== "all") {
-    q += ` WHERE category = ?`;
+    q += " WHERE category = ?";
     params.push(category);
   }
 
-  q += ` ORDER BY COALESCE(published_at, created_at) DESC LIMIT 50`;
+  q += " ORDER BY COALESCE(published_at, created_at) DESC LIMIT 50";
 
   const result = await env.DB.prepare(q).bind(...params).all();
   return json({ ok: true, articles: result.results || [] });
@@ -851,15 +901,13 @@ async function saveNewsDataArticle(env, item, category, topicOverride = "") {
 
   if (!title || !articleUrl || title === "[Removed]") return "skipped";
 
-  const existing = await env.DB.prepare(`SELECT id FROM articles WHERE url = ?`).bind(articleUrl).first();
+  const existing = await env.DB.prepare("SELECT id FROM articles WHERE url = ?").bind(articleUrl).first();
 
   const id = existing?.id || crypto.randomUUID();
   const description = item.description || item.content || "";
   const content = item.content || item.description || "";
   const sourceName = item.source_name || item.source_id || item.source_url || "NewsData.io";
-  const author = Array.isArray(item.creator)
-    ? item.creator.filter(Boolean).join(", ")
-    : item.creator || "";
+  const author = Array.isArray(item.creator) ? item.creator.filter(Boolean).join(", ") : item.creator || "";
   const imageUrl = item.image_url || "";
   const topic = topicOverride || inferTopic(`${title} ${description}`) || "";
   const publishedAt = item.pubDate || item.pubDateTZ || new Date().toISOString();
@@ -902,19 +950,8 @@ async function sendDigest(env) {
     return { ok: false, error: "Missing RESEND_API_KEY secret" };
   }
 
-  const subs = await env.DB.prepare(`
-    SELECT *
-    FROM subscriptions
-    WHERE verified = 1
-    LIMIT 200
-  `).all();
-
-  const articles = await env.DB.prepare(`
-    SELECT *
-    FROM articles
-    ORDER BY COALESCE(published_at, created_at) DESC
-    LIMIT 10
-  `).all();
+  const subs = await env.DB.prepare("SELECT * FROM subscriptions WHERE verified = 1 LIMIT 200").all();
+  const articles = await env.DB.prepare("SELECT * FROM articles ORDER BY COALESCE(published_at, created_at) DESC LIMIT 10").all();
 
   if (!subs.results?.length) {
     return { ok: true, sent: 0, message: "No subscribers." };
@@ -974,23 +1011,23 @@ async function ensurePresetAdmin(env) {
 
     if (!email || !password) return;
 
-    const existing = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
+    const existing = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
 
     if (existing) {
-      await env.DB.prepare(`UPDATE users SET role = 'admin' WHERE email = ?`).bind(email).run();
+      await env.DB.prepare("UPDATE users SET role = 'admin' WHERE email = ?").bind(email).run();
       return;
     }
 
     const hash = await hashPassword(password);
 
-    await env.DB.prepare(`
-      INSERT INTO users (id, email, password_hash, role)
-      VALUES (?, ?, ?, 'admin')
-    `).bind(crypto.randomUUID(), email, hash).run();
+    await env.DB.prepare("INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, 'admin')")
+      .bind(crypto.randomUUID(), email, hash)
+      .run();
   } catch (e) {
     console.error("ensurePresetAdmin failed:", e && e.stack ? e.stack : e);
   }
 }
+
 async function requireAdmin(request, env) {
   const user = await getCurrentUser(request, env);
 
@@ -1020,10 +1057,9 @@ async function createSessionResponse(env, userId, location) {
   const sessionId = crypto.randomUUID();
   const expires = new Date(Date.now() + 1000 * 60 * 60 * 24 * 30);
 
-  await env.DB.prepare(`
-    INSERT INTO sessions (id, user_id, expires_at)
-    VALUES (?, ?, ?)
-  `).bind(sessionId, userId, expires.toISOString()).run();
+  await env.DB.prepare("INSERT INTO sessions (id, user_id, expires_at) VALUES (?, ?, ?)")
+    .bind(sessionId, userId, expires.toISOString())
+    .run();
 
   return redirect(location, {
     "Set-Cookie": `${COOKIE_NAME}=${sessionId}; Path=/; Expires=${expires.toUTCString()}; HttpOnly; Secure; SameSite=Lax`
@@ -1046,9 +1082,7 @@ async function verifyPassword(password, stored) {
 }
 
 function arrayBufferToHex(buffer) {
-  return [...new Uint8Array(buffer)]
-    .map(b => b.toString(16).padStart(2, "0"))
-    .join("");
+  return [...new Uint8Array(buffer)].map(b => b.toString(16).padStart(2, "0")).join("");
 }
 
 async function fetchJson(url) {
@@ -1066,7 +1100,7 @@ async function fetchJson(url) {
 }
 
 function classifyCategory(text) {
-  const t = text.toLowerCase();
+  const t = String(text || "").toLowerCase();
 
   if (/\b(ai|tech|software|cloudflare|roblox|discord|app|cyber|security|data|computer)\b/.test(t)) return "technology";
   if (/\b(stock|market|business|company|economy|bank|money|retail|price)\b/.test(t)) return "business";
@@ -1079,7 +1113,7 @@ function classifyCategory(text) {
 }
 
 function inferTopic(text) {
-  const t = text.toLowerCase();
+  const t = String(text || "").toLowerCase();
 
   if (t.includes("cloudflare")) return "Cloudflare";
   if (t.includes("roblox")) return "Roblox";
@@ -1155,27 +1189,132 @@ function json(data, status = 200) {
 function htmlPage(title, body, env, status = 200) {
   const name = siteName(env);
 
-  return new Response(`<!doctype html>
+  const page = `<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>${escapeHtml(title)} · ${escapeHtml(name)}</title>
   <style>
-    :root {
-      --bg: #09090b;
-      --panel: #111114;
-      --panel2: #18181b;
-      --text: #f4f4f5;
-      --muted: #a1a1aa;
-      --border: #27272a;
-      --brand: #4ade80;
-      --danger: #fb7185;
-    }
+    body { margin: 0; background: #09090b; color: #f4f4f5; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; }
+    a { color: inherit; text-decoration: none; }
+    a:hover { color: #4ade80; }
+    .topbar { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; border-bottom: 1px solid #27272a; background: #111114; position: sticky; top: 0; z-index: 10; }
+    .logo { display: flex; align-items: center; gap: 10px; font-weight: 800; }
+    .logo-mark { width: 32px; height: 32px; display: grid; place-items: center; border-radius: 10px; background: #4ade80; color: #09090b; font-weight: 900; }
+    .nav { display: flex; gap: 16px; color: #a1a1aa; font-size: 15px; }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 64px; }
+    .hero, .admin-head, .panel, .auth, .empty, .article-page, .card { border: 1px solid #27272a; background: #111114; border-radius: 20px; }
+    .hero, .admin-head { display: flex; justify-content: space-between; gap: 16px; align-items: center; padding: 28px; margin-bottom: 20px; }
+    h1 { font-size: clamp(32px, 6vw, 64px); line-height: 1; letter-spacing: -0.06em; margin: 0 0 12px; }
+    h2 { margin-top: 0; }
+    p { color: #a1a1aa; }
+    .eyebrow { color: #4ade80; text-transform: uppercase; font-size: 13px; letter-spacing: 0.14em; font-weight: 800; margin: 0 0 10px; }
+    .hero-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+    button, .button { border: 0; border-radius: 999px; padding: 12px 16px; background: #4ade80; color: #09090b; font-weight: 800; cursor: pointer; display: inline-block; }
+    .secondary { background: #18181b; color: #f4f4f5; border: 1px solid #27272a; }
+    .danger { background: #fb7185; color: #09090b; }
+    input, textarea, select { width: 100%; border: 1px solid #27272a; background: #0c0c0f; color: #f4f4f5; border-radius: 14px; padding: 12px 14px; font: inherit; box-sizing: border-box; }
+    textarea { min-height: 130px; resize: vertical; }
+    label { color: #a1a1aa; font-size: 15px; }
+    .searchbar { display: flex; gap: 10px; margin: 16px 0; }
+    .chips { display: flex; gap: 8px; overflow-x: auto; padding: 4px 0 16px; }
+    .chip { padding: 9px 13px; border: 1px solid #27272a; border-radius: 999px; color: #a1a1aa; white-space: nowrap; background: #18181b; }
+    .chip.active { color: #09090b; background: #4ade80; border-color: #4ade80; font-weight: 800; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
+    .card { overflow: hidden; }
+    .card img, .no-image { width: 100%; height: 170px; object-fit: cover; display: grid; place-items: center; background: #18181b; color: #a1a1aa; text-transform: uppercase; font-weight: 900; letter-spacing: 0.12em; }
+    .card-body, .panel, .auth, .empty, .article-page { padding: 20px; }
+    .card h2 { font-size: 18px; line-height: 1.2; margin: 8px 0; }
+    .meta, .card-footer { display: flex; justify-content: space-between; gap: 12px; color: #a1a1aa; font-size: 13px; }
+    .auth { max-width: 460px; margin: 32px auto; }
+    .auth form, .stack { display: grid; gap: 12px; }
+    .error { color: #fb7185; font-weight: 700; }
+    .article-page { max-width: 850px; margin: 0 auto; }
+    .article-image { width: 100%; border-radius: 16px; margin: 16px 0; max-height: 460px; object-fit: cover; }
+    .article-content { color: #d4d4d8; font-size: 17px; margin: 22px 0; }
+    .panel { margin: 16px 0; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 720px; }
+    th, td { padding: 11px; border-bottom: 1px solid #27272a; text-align: left; vertical-align: top; }
+    th { color: #a1a1aa; font-size: 14px; }
+    code, pre { background: #050507; border: 1px solid #27272a; border-radius: 11px; padding: 3px 6px; }
+    pre { overflow-x: auto; padding: 16px; }
+    .checks { display: grid; gap: 6px; }
+    .checks input { width: auto; }
+    @media (max-width: 760px) { .hero, .admin-head, .searchbar { flex-direction: column; align-items: stretch; } }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <a class="logo" href="/">
+      <span class="logo-mark">G</span>
+      <span>${escapeHtml(name)}</span>
+    </a>
+    <nav class="nav">
+      <a href="/">News</a>
+      <a href="/subscribe">Subscribe</a>
+      <a href="/admin">Admin</a>
+    </nav>
+  </header>
 
-    * {
-      box-sizing: border-box;
-    }
+  <main class="wrap">
+    ${body}
+  </main>
+</body>
+</html>`;
 
-    body {
-      margin: 0
+  return new Response(page, {
+    status,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8"
+    }
+  });
+}
+
+function paragraphs(text) {
+  return String(text || "")
+    .split(/\n{2,}/)
+    .map(p => p.trim())
+    .filter(Boolean)
+    .map(p => `<p>${escapeHtml(p)}</p>`)
+    .join("");
+}
+
+function siteName(env) {
+  return env.SITE_NAME || "Gaband323 News";
+}
+
+function siteOrigin(env) {
+  return env.SITE_ORIGIN || "https://news.gaband323.dev";
+}
+
+function label(value) {
+  const v = String(value || "");
+  if (v === "all") return "All";
+  return v.charAt(0).toUpperCase() + v.slice(1);
+}
+
+function formatDate(value) {
+  if (!value) return "";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return d.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric"
+  });
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value);
+}
