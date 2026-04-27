@@ -1,5 +1,6 @@
 const CATEGORIES = ["general", "business", "technology", "entertainment", "health", "science", "sports"];
 const COOKIE_NAME = "gaband323_news_session";
+const DEFAULT_NEWS_API_ORIGIN = "https://api.news.gaband323.dev";
 
 export default {
   async fetch(request, env) {
@@ -219,7 +220,7 @@ async function home(request, env) {
   return page("Home", `
     <section class="hero">
       <h1>${esc(siteName(env))}</h1>
-      <p>Auto-updating news powered by Gaband323’s built-in Google News RSS API.</p>
+      <p>Auto-updating news powered by the Gaband323 News API.</p>
       <p>
         ${env.__viewer?.role === "admin" ? `<a class="button" href="/admin">Admin</a>` : ""}
         ${env.__viewer ? `<a class="button secondary" href="/settings">Settings</a>` : `<a class="button secondary" href="/signup">Create account</a>`}
@@ -576,7 +577,7 @@ async function admin(request, env) {
     <section class="panel">
       <h2>Sync news</h2>
       <form method="POST" action="/admin/sync">
-        <button>Sync Google News RSS now</button>
+        <button>Sync from Gaband323 News API</button>
       </form>
     </section>
 
@@ -751,16 +752,7 @@ function subscribeForm(error) {
 }
 
 async function runNewsSync(env) {
-  const categoryQueries = {
-    general: "top stories",
-    business: "business news",
-    technology: "technology news",
-    entertainment: "entertainment news",
-    health: "health news",
-    science: "science news",
-    sports: "sports news"
-  };
-
+  const apiOrigin = String(env.NEWS_API_ORIGIN || DEFAULT_NEWS_API_ORIGIN).replace(/\/$/, "");
   const categories = splitEnv(env.FETCH_CATEGORIES || CATEGORIES.join(","))
     .map(cleanCategory)
     .filter(c => c !== "all");
@@ -770,27 +762,23 @@ async function runNewsSync(env) {
   const failed = [];
 
   for (const category of categories) {
-    const query = categoryQueries[category] || "top stories";
-    const endpoint = new URL("https://news.google.com/rss/search");
-
-    endpoint.searchParams.set("q", query);
-    endpoint.searchParams.set("hl", "en-US");
-    endpoint.searchParams.set("gl", "US");
-    endpoint.searchParams.set("ceid", "US:en");
+    const endpoint = new URL(`${apiOrigin}/category/${encodeURIComponent(category)}`);
+    endpoint.searchParams.set("limit", env.NEWS_API_LIMIT || "20");
 
     try {
       const res = await fetch(endpoint.toString(), {
         headers: {
-          "User-Agent": "Gaband323News/1.0"
+          "User-Agent": "Gaband323NewsSite/1.0"
         }
       });
 
-      if (!res.ok) throw new Error(`Google News RSS HTTP ${res.status}`);
+      const data = await res.json();
 
-      const xml = await res.text();
-      const items = parseRssItems(xml).slice(0, 12);
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `API HTTP ${res.status}`);
+      }
 
-      for (const item of items) {
+      for (const item of data.articles || []) {
         const result = await saveNewsItem(env, item, category);
 
         if (result === "inserted") inserted++;
@@ -803,35 +791,22 @@ async function runNewsSync(env) {
 
   return {
     ok: failed.length === 0,
-    provider: "google_news_rss",
+    provider: "gaband323_news_api",
+    api_origin: apiOrigin,
     inserted,
     updated,
     failed
   };
 }
 
-async function saveNewsItem(env, item, category) {
+async function saveNewsItem(env, item, fallbackCategory = "general") {
   const title = item.title || "";
-  const url = item.link || "";
+  const url = item.url || item.link || "";
 
   if (!title || !url) return "skipped";
 
   const existing = await env.DB.prepare(`SELECT id FROM articles WHERE url = ?`).bind(url).first();
-  const id = existing?.id || crypto.randomUUID();
-
-  const description = item.description || "";
-  const sourceName = item.source || guessSourceFromTitle(title) || "Google News";
-  const publishedAt = item.pubDate || new Date().toISOString();
-
-  let imageUrl = item.image_url || item.image || "";
-
-  if (!imageUrl) {
-    imageUrl = await findArticleImage(url);
-  }
-
-  if (!imageUrl) {
-    imageUrl = fallbackSourceImage(url);
-  }
+  const id = existing?.id || item.id || crypto.randomUUID();
 
   await env.DB.prepare(`
     INSERT INTO articles (
@@ -845,188 +820,25 @@ async function saveNewsItem(env, item, category) {
       content = excluded.content,
       image_url = excluded.image_url,
       source_name = excluded.source_name,
+      author = excluded.author,
       category = excluded.category,
+      topic = excluded.topic,
       published_at = excluded.published_at
   `).bind(
     id,
     title,
-    description,
-    description,
+    item.description || "",
+    item.content || item.description || "",
     url,
-    imageUrl,
-    sourceName,
-    "",
-    cleanCategory(category),
-    "",
-    publishedAt
+    item.image_url || "",
+    item.source_name || "Gaband323 News API",
+    item.author || "",
+    cleanCategory(item.category || fallbackCategory),
+    item.topic || "",
+    item.published_at || new Date().toISOString()
   ).run();
 
   return existing ? "updated" : "inserted";
-}
-
-function parseRssItems(xml) {
-  const matches = String(xml || "").match(/<item>[\s\S]*?<\/item>/g) || [];
-
-  return matches.map(raw => {
-    const title = decodeHtml(stripCdata(getXmlTag(raw, "title")));
-    const link = decodeHtml(stripCdata(getXmlTag(raw, "link")));
-    const pubDateRaw = decodeHtml(stripCdata(getXmlTag(raw, "pubDate")));
-    const descriptionRaw = decodeHtml(stripCdata(getXmlTag(raw, "description")));
-    const source = decodeHtml(stripCdata(getXmlTag(raw, "source")));
-
-    const imageFromDescription = extractImageFromHtml(descriptionRaw);
-    const imageFromMedia =
-      getXmlAttribute(raw, "media:content", "url") ||
-      getXmlAttribute(raw, "media:thumbnail", "url") ||
-      getXmlAttribute(raw, "enclosure", "url");
-
-    const pubDate = (() => {
-      const d = new Date(pubDateRaw);
-      return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
-    })();
-
-    return {
-      title: cleanGoogleNewsTitle(title),
-      link,
-      description: cleanDescription(descriptionRaw),
-      source: source || guessSourceFromTitle(title),
-      image_url: imageFromMedia || imageFromDescription || "",
-      pubDate
-    };
-  }).filter(item => item.title && item.link);
-}
-
-async function findArticleImage(url) {
-  try {
-    const res = await fetchWithTimeout(url, 3500);
-
-    if (!res.ok) return "";
-
-    const contentType = res.headers.get("content-type") || "";
-    if (!contentType.includes("text/html")) return "";
-
-    const html = await res.text();
-
-    return (
-      absolutizeUrl(getMetaContent(html, "property", "og:image"), url) ||
-      absolutizeUrl(getMetaContent(html, "name", "twitter:image"), url) ||
-      absolutizeUrl(getMetaContent(html, "property", "og:image:url"), url) ||
-      absolutizeUrl(extractImageFromHtml(html), url) ||
-      ""
-    );
-  } catch {
-    return "";
-  }
-}
-
-async function fetchWithTimeout(url, ms = 3500) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort("timeout"), ms);
-
-  try {
-    return await fetch(url, {
-      redirect: "follow",
-      signal: controller.signal,
-      headers: {
-        "User-Agent": "Mozilla/5.0 Gaband323NewsBot/1.0"
-      }
-    });
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-function getMetaContent(html, attrName, attrValue) {
-  const escapedAttrValue = attrValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-  const regex1 = new RegExp(
-    `<meta[^>]+${attrName}=["']${escapedAttrValue}["'][^>]+content=["']([^"']+)["'][^>]*>`,
-    "i"
-  );
-
-  const regex2 = new RegExp(
-    `<meta[^>]+content=["']([^"']+)["'][^>]+${attrName}=["']${escapedAttrValue}["'][^>]*>`,
-    "i"
-  );
-
-  const match = html.match(regex1) || html.match(regex2);
-  return match ? decodeHtml(match[1]) : "";
-}
-
-function extractImageFromHtml(html) {
-  const match = String(html || "").match(/<img[^>]+src=["']([^"']+)["']/i);
-  return match ? decodeHtml(match[1]) : "";
-}
-
-function getXmlAttribute(xml, tag, attr) {
-  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const escapedAttr = attr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-  const regex = new RegExp(`<${escapedTag}[^>]+${escapedAttr}=["']([^"']+)["'][^>]*>`, "i");
-  const match = String(xml || "").match(regex);
-
-  return match ? decodeHtml(match[1]) : "";
-}
-
-function fallbackSourceImage(url) {
-  try {
-    const host = new URL(url).hostname;
-    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=256`;
-  } catch {
-    return "";
-  }
-}
-
-function absolutizeUrl(maybeUrl, baseUrl) {
-  if (!maybeUrl) return "";
-
-  try {
-    return new URL(maybeUrl, baseUrl).toString();
-  } catch {
-    return "";
-  }
-}
-
-function getXmlTag(xml, tag) {
-  const match = String(xml || "").match(new RegExp(`<${tag}(?: [^>]*)?>([\\s\\S]*?)<\\/${tag}>`, "i"));
-  return match ? match[1] : "";
-}
-
-function stripCdata(value) {
-  return String(value || "")
-    .replace(/^<!\[CDATA\[/, "")
-    .replace(/\]\]>$/, "")
-    .trim();
-}
-
-function decodeHtml(value) {
-  return String(value || "")
-    .replaceAll("&amp;", "&")
-    .replaceAll("&lt;", "<")
-    .replaceAll("&gt;", ">")
-    .replaceAll("&quot;", '"')
-    .replaceAll("&#39;", "'")
-    .replaceAll("&#039;", "'")
-    .replaceAll("&apos;", "'");
-}
-
-function cleanDescription(value) {
-  return String(value || "")
-    .replace(/<[^>]*>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 600);
-}
-
-function cleanGoogleNewsTitle(title) {
-  return String(title || "")
-    .replace(/\s+-\s+[^-]{2,100}$/, "")
-    .trim();
-}
-
-function guessSourceFromTitle(title) {
-  const parts = String(title || "").split(" - ");
-  return parts.length > 1 ? parts[parts.length - 1].trim() : "Google News";
 }
 
 async function apiArticles(request, env) {
@@ -1047,7 +859,7 @@ async function apiArticles(request, env) {
 
   return json({
     ok: true,
-    provider: "gaband323_news_api",
+    provider: "gaband323_main_site",
     articles: result.results || []
   });
 }
@@ -1295,4 +1107,4 @@ function esc(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-      }
+}
