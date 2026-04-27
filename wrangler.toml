@@ -15,16 +15,16 @@ SITE_NAME = "Gaband News"
 SITE_ORIGIN = "https://news.gaband323.dev"
 NEWS_COUNTRY = "us"
 NEWS_LANG = "en"
-ADMIN_EMAILS = "your-email@example.com"
-EMAIL_FROM = "Gaband News <updates@news.gaband323.dev>"
-DIGEST_SUBJECT = "Your Gaband News update"
-FETCH_CATEGORIES = "general,business,technology,entertainment,health,science,sports"
+ADMIN_EMAILS = "gaband323@gmail.com"
+EMAIL_FROM = "gaband323 News <updates@news.gaband323.dev>"
+DIGEST_SUBJECT = "Your gaband323 News update"
+FETCH_CATEGORIES = "general,business,technology,entertainment,health,politics,science,sports"
 TRENDING_QUERIES = "AI,Cloudflare,Roblox,Discord,Los Angeles,transportation"
 
 [[d1_databases]]
 binding = "DB"
 database_name = "gaband-news-db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "c5067299-9c0a-40b8-811e-f692b84eb221"
 
 [triggers]
 crons = ["*/30 * * * *", "0 14 * * *"]
