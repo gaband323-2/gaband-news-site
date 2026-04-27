@@ -788,7 +788,7 @@ async function runNewsSync(env) {
       if (!res.ok) throw new Error(`Google News RSS HTTP ${res.status}`);
 
       const xml = await res.text();
-      const items = parseRssItems(xml).slice(0, 25);
+      const items = parseRssItems(xml).slice(0, 12);
 
       for (const item of items) {
         const result = await saveNewsItem(env, item, category);
@@ -820,8 +820,18 @@ async function saveNewsItem(env, item, category) {
   const id = existing?.id || crypto.randomUUID();
 
   const description = item.description || "";
-  const sourceName = item.source || "Google News";
+  const sourceName = item.source || guessSourceFromTitle(title) || "Google News";
   const publishedAt = item.pubDate || new Date().toISOString();
+
+  let imageUrl = item.image_url || item.image || "";
+
+  if (!imageUrl) {
+    imageUrl = await findArticleImage(url);
+  }
+
+  if (!imageUrl) {
+    imageUrl = fallbackSourceImage(url);
+  }
 
   await env.DB.prepare(`
     INSERT INTO articles (
@@ -833,6 +843,7 @@ async function saveNewsItem(env, item, category) {
       title = excluded.title,
       description = excluded.description,
       content = excluded.content,
+      image_url = excluded.image_url,
       source_name = excluded.source_name,
       category = excluded.category,
       published_at = excluded.published_at
@@ -842,7 +853,7 @@ async function saveNewsItem(env, item, category) {
     description,
     description,
     url,
-    "",
+    imageUrl,
     sourceName,
     "",
     cleanCategory(category),
@@ -863,6 +874,12 @@ function parseRssItems(xml) {
     const descriptionRaw = decodeHtml(stripCdata(getXmlTag(raw, "description")));
     const source = decodeHtml(stripCdata(getXmlTag(raw, "source")));
 
+    const imageFromDescription = extractImageFromHtml(descriptionRaw);
+    const imageFromMedia =
+      getXmlAttribute(raw, "media:content", "url") ||
+      getXmlAttribute(raw, "media:thumbnail", "url") ||
+      getXmlAttribute(raw, "enclosure", "url");
+
     const pubDate = (() => {
       const d = new Date(pubDateRaw);
       return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
@@ -873,9 +890,101 @@ function parseRssItems(xml) {
       link,
       description: cleanDescription(descriptionRaw),
       source: source || guessSourceFromTitle(title),
+      image_url: imageFromMedia || imageFromDescription || "",
       pubDate
     };
   }).filter(item => item.title && item.link);
+}
+
+async function findArticleImage(url) {
+  try {
+    const res = await fetchWithTimeout(url, 3500);
+
+    if (!res.ok) return "";
+
+    const contentType = res.headers.get("content-type") || "";
+    if (!contentType.includes("text/html")) return "";
+
+    const html = await res.text();
+
+    return (
+      absolutizeUrl(getMetaContent(html, "property", "og:image"), url) ||
+      absolutizeUrl(getMetaContent(html, "name", "twitter:image"), url) ||
+      absolutizeUrl(getMetaContent(html, "property", "og:image:url"), url) ||
+      absolutizeUrl(extractImageFromHtml(html), url) ||
+      ""
+    );
+  } catch {
+    return "";
+  }
+}
+
+async function fetchWithTimeout(url, ms = 3500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort("timeout"), ms);
+
+  try {
+    return await fetch(url, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 Gaband323NewsBot/1.0"
+      }
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function getMetaContent(html, attrName, attrValue) {
+  const escapedAttrValue = attrValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const regex1 = new RegExp(
+    `<meta[^>]+${attrName}=["']${escapedAttrValue}["'][^>]+content=["']([^"']+)["'][^>]*>`,
+    "i"
+  );
+
+  const regex2 = new RegExp(
+    `<meta[^>]+content=["']([^"']+)["'][^>]+${attrName}=["']${escapedAttrValue}["'][^>]*>`,
+    "i"
+  );
+
+  const match = html.match(regex1) || html.match(regex2);
+  return match ? decodeHtml(match[1]) : "";
+}
+
+function extractImageFromHtml(html) {
+  const match = String(html || "").match(/<img[^>]+src=["']([^"']+)["']/i);
+  return match ? decodeHtml(match[1]) : "";
+}
+
+function getXmlAttribute(xml, tag, attr) {
+  const escapedTag = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedAttr = attr.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  const regex = new RegExp(`<${escapedTag}[^>]+${escapedAttr}=["']([^"']+)["'][^>]*>`, "i");
+  const match = String(xml || "").match(regex);
+
+  return match ? decodeHtml(match[1]) : "";
+}
+
+function fallbackSourceImage(url) {
+  try {
+    const host = new URL(url).hostname;
+    return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(host)}&sz=256`;
+  } catch {
+    return "";
+  }
+}
+
+function absolutizeUrl(maybeUrl, baseUrl) {
+  if (!maybeUrl) return "";
+
+  try {
+    return new URL(maybeUrl, baseUrl).toString();
+  } catch {
+    return "";
+  }
 }
 
 function getXmlTag(xml, tag) {
@@ -1186,4 +1295,4 @@ function esc(value) {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
-                                             }
+      }
