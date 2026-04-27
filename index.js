@@ -1,5 +1,6 @@
 const CATEGORIES = ['general', 'business', 'technology', 'entertainment', 'health', 'science', 'sports'];
 const DIGEST_CRON = '0 14 * * *';
+const DEFAULT_SITE_NAME = 'Gaband323 News';
 
 export default {
   async fetch(request, env, ctx) {
@@ -10,7 +11,9 @@ export default {
       if (url.pathname === '/admin') return html(adminPage(), env);
       if (url.pathname === '/login') return html(loginPage(), env);
       if (url.pathname === '/signup') return html(signupPage(), env);
+      if (url.pathname === '/code-login') return html(codeLoginPage(), env);
       if (url.pathname === '/subscribe') return html(subscribePage(), env);
+      if (url.pathname.startsWith('/article/')) return html(await articlePage(url.pathname.split('/').pop(), env), env);
       return html(homePage(), env);
     } catch (error) {
       console.error(error);
@@ -40,6 +43,14 @@ async function apiRouter(request, env, ctx) {
     return json({ articles: rows.results || [] });
   }
 
+  if (method === 'GET' && url.pathname.startsWith('/api/articles/')) {
+    const id = Number(url.pathname.split('/').pop());
+    if (!Number.isFinite(id)) return json({ error: 'Bad article id' }, 400);
+    const article = await env.DB.prepare(`SELECT * FROM articles WHERE id = ? AND is_deleted = 0`).bind(id).first();
+    if (!article) return json({ error: 'Article not found' }, 404);
+    return json({ article });
+  }
+
   if (method === 'GET' && url.pathname === '/api/topics') {
     const rows = await env.DB.prepare(`SELECT topic, COUNT(*) AS count FROM articles WHERE is_deleted = 0 AND topic IS NOT NULL AND topic != '' GROUP BY topic ORDER BY count DESC LIMIT 25`).all();
     return json({ topics: rows.results || [] });
@@ -55,6 +66,7 @@ async function apiRouter(request, env, ctx) {
   }
 
   if (method === 'POST' && url.pathname === '/api/signup') {
+    await ensurePresetAdmin(env);
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     const password = String(body.password || '');
@@ -67,6 +79,7 @@ async function apiRouter(request, env, ctx) {
   }
 
   if (method === 'POST' && url.pathname === '/api/login') {
+    await ensurePresetAdmin(env);
     const body = await readJson(request);
     const email = normalizeEmail(body.email);
     const password = String(body.password || '');
@@ -78,6 +91,25 @@ async function apiRouter(request, env, ctx) {
     return json({ ok: true, is_admin: Boolean(shouldBeAdmin) }, 200, { 'Set-Cookie': cookie });
   }
 
+  if (method === 'POST' && url.pathname === '/api/code-login') {
+    await ensurePresetAdmin(env);
+    const body = await readJson(request);
+    const email = normalizeEmail(body.email);
+    const code = String(body.code || '').trim().toUpperCase();
+    if (!email || !code) return json({ error: 'Email and code required' }, 400);
+    const row = await env.DB.prepare(`SELECT * FROM login_codes WHERE code = ?`).bind(code).first();
+    if (!row) return json({ error: 'Invalid code' }, 401);
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return json({ error: 'Code expired' }, 401);
+    if (Number(row.max_uses || 0) > 0 && Number(row.uses || 0) >= Number(row.max_uses)) return json({ error: 'Code already used up' }, 401);
+    const existing = await env.DB.prepare(`SELECT * FROM users WHERE email = ?`).bind(email).first();
+    const isAdmin = Number(existing?.is_admin || 0) || Number(row.is_admin || 0) || (adminList(env).includes(email) ? 1 : 0);
+    if (existing) await env.DB.prepare(`UPDATE users SET is_admin = ? WHERE email = ?`).bind(isAdmin, email).run();
+    else await env.DB.prepare(`INSERT INTO users(email, password_hash, is_admin) VALUES(?, ?, ?)`).bind(email, await hashPassword(crypto.randomUUID()), isAdmin).run();
+    await env.DB.prepare(`UPDATE login_codes SET uses = uses + 1 WHERE id = ?`).bind(row.id).run();
+    const cookie = await createSessionCookie(email, isAdmin, env);
+    return json({ ok: true, is_admin: Boolean(isAdmin) }, 200, { 'Set-Cookie': cookie });
+  }
+
   if (method === 'POST' && url.pathname === '/api/logout') {
     return json({ ok: true }, 200, { 'Set-Cookie': `gn_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0` });
   }
@@ -85,6 +117,69 @@ async function apiRouter(request, env, ctx) {
   if (method === 'GET' && url.pathname === '/api/me') {
     const session = await requireSession(request, env, false);
     return json({ user: session });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/admin/users') {
+    await requireSession(request, env, true);
+    const rows = await env.DB.prepare(`SELECT id, email, is_admin, created_at FROM users ORDER BY created_at DESC LIMIT 200`).all();
+    return json({ users: rows.results || [] });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/admin/users') {
+    await requireSession(request, env, true);
+    const b = await readJson(request);
+    const email = normalizeEmail(b.email);
+    const password = String(b.password || '');
+    const isAdmin = b.is_admin ? 1 : 0;
+    if (!email) return json({ error: 'Valid email required' }, 400);
+    const existing = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
+    if (existing) {
+      if (password) {
+        if (password.length < 8) return json({ error: 'Password must be 8+ characters' }, 400);
+        await env.DB.prepare(`UPDATE users SET password_hash = ?, is_admin = ? WHERE email = ?`).bind(await hashPassword(password), isAdmin, email).run();
+      } else {
+        await env.DB.prepare(`UPDATE users SET is_admin = ? WHERE email = ?`).bind(isAdmin, email).run();
+      }
+    } else {
+      if (password.length < 8) return json({ error: 'Password must be 8+ characters for new accounts' }, 400);
+      await env.DB.prepare(`INSERT INTO users(email, password_hash, is_admin) VALUES(?, ?, ?)`).bind(email, await hashPassword(password), isAdmin).run();
+    }
+    return json({ ok: true });
+  }
+
+  if (method === 'DELETE' && url.pathname.startsWith('/api/admin/users/')) {
+    const session = await requireSession(request, env, true);
+    const id = Number(url.pathname.split('/').pop());
+    if (!Number.isFinite(id)) return json({ error: 'Bad user id' }, 400);
+    const target = await env.DB.prepare(`SELECT email FROM users WHERE id = ?`).bind(id).first();
+    if (target?.email === session.email) return json({ error: 'You cannot delete your own active account' }, 400);
+    await env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(id).run();
+    return json({ ok: true });
+  }
+
+  if (method === 'GET' && url.pathname === '/api/admin/login-codes') {
+    await requireSession(request, env, true);
+    const rows = await env.DB.prepare(`SELECT * FROM login_codes ORDER BY created_at DESC LIMIT 100`).all();
+    return json({ codes: rows.results || [] });
+  }
+
+  if (method === 'POST' && url.pathname === '/api/admin/login-codes') {
+    const session = await requireSession(request, env, true);
+    const b = await readJson(request);
+    const code = String(b.code || makeLoginCode()).trim().toUpperCase().replace(/[^A-Z0-9-]/g, '').slice(0, 40) || makeLoginCode();
+    const isAdmin = b.is_admin ? 1 : 0;
+    const maxUses = clamp(Number(b.max_uses || 1), 1, 9999);
+    const expiresAt = b.expires_at ? new Date(b.expires_at).toISOString() : null;
+    await env.DB.prepare(`INSERT INTO login_codes(code, is_admin, max_uses, expires_at, created_by) VALUES(?, ?, ?, ?, ?) ON CONFLICT(code) DO UPDATE SET is_admin=excluded.is_admin, max_uses=excluded.max_uses, expires_at=excluded.expires_at`).bind(code, isAdmin, maxUses, expiresAt, session.email).run();
+    return json({ ok: true, code });
+  }
+
+  if (method === 'DELETE' && url.pathname.startsWith('/api/admin/login-codes/')) {
+    await requireSession(request, env, true);
+    const id = Number(url.pathname.split('/').pop());
+    if (!Number.isFinite(id)) return json({ error: 'Bad code id' }, 400);
+    await env.DB.prepare(`DELETE FROM login_codes WHERE id = ?`).bind(id).run();
+    return json({ ok: true });
   }
 
   if (method === 'POST' && url.pathname === '/api/admin/sync') {
@@ -229,7 +324,7 @@ async function fetchJson(url) {
 }
 
 function homePage() { return `
-<section class="hero"><div><p class="eyebrow">Auto-updating headlines</p><h1>Gaband News</h1><p>Top stories, topic feeds, categories, and email updates running fully on Cloudflare Workers.</p><div class="actions"><a href="/subscribe">Get email updates</a><a class="secondary" href="/admin">Admin</a></div></div></section>
+<section class="hero"><div><p class="eyebrow">Auto-updating headlines</p><h1>Gaband323 News</h1><p>Top stories, topic feeds, categories, and email updates running fully on Cloudflare Workers. Articles open on this site first, with the original source linked inside.</p><div class="actions"><a href="/subscribe">Get email updates</a><a class="secondary" href="/admin">Admin</a></div></div></section>
 <section class="toolbar"><input id="q" placeholder="Search news..."/><select id="cat"><option value="">All categories</option>${CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select></section>
 <section id="topics" class="topics"></section><main id="articles" class="grid"></main>
 <script>
@@ -241,40 +336,72 @@ async function load(){
  const topics = await fetch('/api/topics').then(r=>r.json());
  $('#topics').innerHTML = topics.topics.map(t=>'<button onclick="document.querySelector(\'#q\').value=\''+escapeHtml(t.topic)+'\';load()">#'+escapeHtml(t.topic)+' <span>'+t.count+'</span></button>').join('');
 }
-function articleCard(a){return '<article class="card">'+(a.image_url?'<img src="'+escapeAttr(a.image_url)+'" loading="lazy"/>':'')+'<div><span class="pill">'+escapeHtml(a.category)+'</span><h2><a href="'+escapeAttr(a.url)+'" target="_blank" rel="noreferrer">'+escapeHtml(a.title)+'</a></h2><p>'+escapeHtml(a.description||'')+'</p><footer>'+escapeHtml(a.source||'Unknown source')+' · '+(a.published_at?new Date(a.published_at).toLocaleString():'')+'</footer></div></article>'}
+function articleCard(a){return '<article class="card">'+(a.image_url?'<img src="'+escapeAttr(a.image_url)+'" loading="lazy"/>':'')+'<div><span class="pill">'+escapeHtml(a.category)+'</span><h2><a href="/article/'+a.id+'">'+escapeHtml(a.title)+'</a></h2><p>'+escapeHtml(a.description||'')+'</p><footer>'+escapeHtml(a.source||'Unknown source')+' · '+(a.published_at?new Date(a.published_at).toLocaleString():'')+'</footer></div></article>'}
 function escapeHtml(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function escapeAttr(s){return escapeHtml(s).replace(new RegExp(String.fromCharCode(96),'g'),'&#96;')}
 $('#q').addEventListener('input',()=>setTimeout(load,150)); $('#cat').addEventListener('change',load); load();
 </script>`; }
 
+async function articlePage(idRaw, env) {
+  const id = Number(idRaw);
+  if (!Number.isFinite(id)) return `<section class="authbox"><h1>Article not found</h1><p>Bad article link.</p><p><a href="/">Back home</a></p></section>`;
+  const a = await env.DB.prepare(`SELECT * FROM articles WHERE id = ? AND is_deleted = 0`).bind(id).first();
+  if (!a) return `<section class="authbox"><h1>Article not found</h1><p>This article is missing or deleted.</p><p><a href="/">Back home</a></p></section>`;
+  return `<article class="article-page">${a.image_url?`<img class="article-hero" src="${escapeHtmlServer(a.image_url)}" alt="">`:''}<span class="pill">${escapeHtmlServer(a.category)}</span><h1>${escapeHtmlServer(a.title)}</h1><p class="muted">${escapeHtmlServer(a.source||'Unknown source')} ${a.published_at?'· '+escapeHtmlServer(new Date(a.published_at).toLocaleString()):''}</p><p class="lede">${escapeHtmlServer(a.description||'')}</p>${a.content?`<p>${escapeHtmlServer(String(a.content).replace(/\[\+\d+ chars\]/g,''))}</p>`:''}<div class="actions"><a href="${escapeHtmlServer(a.url)}" target="_blank" rel="noreferrer">Read original source</a><a class="secondary" href="/">Back to headlines</a></div></article>`;
+}
+
 function adminPage() { return `
-<section class="hero small"><h1>Admin</h1><p>Sync, add, and remove stories. Only emails listed in <code>ADMIN_EMAILS</code> get admin powers after signup/login.</p></section>
+<section class="hero small"><h1>Admin</h1><p>Sync news, add/remove stories, add accounts, and create one-time login codes.</p></section>
 <section id="auth" class="panel"><p>Checking login...</p></section>
 <section id="admin" class="admin hidden">
  <div class="actions"><button onclick="syncNews()">Run news sync now</button><button onclick="sendDigest()">Send digest now</button><button class="secondary" onclick="logout()">Logout</button></div>
  <pre id="out"></pre>
- <form id="add" class="panel"><h2>Add article</h2><input name="title" placeholder="Title" required><input name="url" placeholder="https://article-url" required><input name="source" placeholder="Source"><select name="category">${CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select><textarea name="description" placeholder="Description"></textarea><input name="image_url" placeholder="Image URL"><button>Add / update article</button></form>
- <main id="articles" class="list"></main>
+ <form id="add" class="panel"><h2>Add article</h2><input name="title" placeholder="Title" required><input name="url" placeholder="https://article-url" required><input name="source" placeholder="Source"><select name="category">${CATEGORIES.map(c=>`<option>${c}</option>`).join('')}</select><textarea name="description" placeholder="Description"></textarea><input name="image_url" placeholder="Image URL"><label><input type="checkbox" name="is_pinned" value="1"> Pin this article</label><button>Add / update article</button></form>
+ <form id="userForm" class="panel"><h2>Add / update account</h2><input name="email" type="email" placeholder="email@example.com" required><input name="password" type="password" placeholder="Password, 8+ chars for new accounts"><label><input type="checkbox" name="is_admin" value="1"> Make admin</label><button>Save account</button></form>
+ <form id="codeForm" class="panel"><h2>Create login code</h2><p class="muted">Leave code blank to auto-generate one. Users can go to <code>/code-login</code>.</p><input name="code" placeholder="Optional custom code"><input name="max_uses" type="number" min="1" value="1" placeholder="Max uses"><input name="expires_at" type="datetime-local"><label><input type="checkbox" name="is_admin" value="1"> Code grants admin</label><button>Create code</button></form>
+ <section class="panel"><h2>Accounts</h2><main id="users" class="list compact"></main></section>
+ <section class="panel"><h2>Login codes</h2><main id="codes" class="list compact"></main></section>
+ <section class="panel"><h2>Articles</h2><main id="articles" class="list compact"></main></section>
 </section>
 <script>
-async function boot(){ const me=await fetch('/api/me').then(r=>r.ok?r.json():null); if(!me?.user){location.href='/login';return} if(!me.user.is_admin){document.querySelector('#auth').innerHTML='<p>You are logged in, but not an admin. Add your email to ADMIN_EMAILS and log in again.</p>';return} document.querySelector('#auth').classList.add('hidden'); document.querySelector('#admin').classList.remove('hidden'); load(); }
-async function load(){ const data=await fetch('/api/articles?limit=100').then(r=>r.json()); document.querySelector('#articles').innerHTML=data.articles.map(a=>'<article class="row"><div><b>'+esc(a.title)+'</b><p>'+esc(a.category)+' · '+esc(a.source||'')+'</p></div><button onclick="del('+a.id+')">Delete</button></article>').join('') }
+async function boot(){ const me=await fetch('/api/me').then(r=>r.ok?r.json():null); if(!me?.user){location.href='/login';return} if(!me.user.is_admin){document.querySelector('#auth').innerHTML='<p>You are logged in, but not an admin. Add your email to ADMIN_EMAILS or use a preset admin login.</p>';return} document.querySelector('#auth').classList.add('hidden'); document.querySelector('#admin').classList.remove('hidden'); load(); }
+async function load(){
+ const data=await fetch('/api/articles?limit=100').then(r=>r.json()); document.querySelector('#articles').innerHTML=data.articles.map(a=>'<article class="row"><div><b><a href="/article/'+a.id+'">'+esc(a.title)+'</a></b><p>'+esc(a.category)+' · '+esc(a.source||'')+'</p></div><button onclick="del('+a.id+')">Delete</button></article>').join('') || '<p class="muted">No articles yet.</p>';
+ const users=await fetch('/api/admin/users').then(r=>r.json()); document.querySelector('#users').innerHTML=users.users.map(u=>'<article class="row"><div><b>'+esc(u.email)+'</b><p>'+(u.is_admin?'Admin':'User')+' · '+esc(u.created_at||'')+'</p></div><button onclick="delUser('+u.id+')">Delete</button></article>').join('') || '<p class="muted">No accounts yet.</p>';
+ const codes=await fetch('/api/admin/login-codes').then(r=>r.json()); document.querySelector('#codes').innerHTML=codes.codes.map(c=>'<article class="row"><div><b>'+esc(c.code)+'</b><p>'+(c.is_admin?'Admin code':'User code')+' · uses '+c.uses+'/'+c.max_uses+(c.expires_at?' · expires '+esc(c.expires_at):'')+'</p></div><button onclick="delCode('+c.id+')">Delete</button></article>').join('') || '<p class="muted">No codes yet.</p>';
+}
 async function syncNews(){out('Syncing...'); out(JSON.stringify(await fetch('/api/admin/sync',{method:'POST'}).then(r=>r.json()),null,2)); load();}
 async function sendDigest(){out('Sending...'); out(JSON.stringify(await fetch('/api/admin/digest',{method:'POST'}).then(r=>r.json()),null,2));}
 async function del(id){ await fetch('/api/admin/articles/'+id,{method:'DELETE'}); load(); }
+async function delUser(id){ if(confirm('Delete this account?')){await fetch('/api/admin/users/'+id,{method:'DELETE'}); load();} }
+async function delCode(id){ await fetch('/api/admin/login-codes/'+id,{method:'DELETE'}); load(); }
 async function logout(){ await fetch('/api/logout',{method:'POST'}); location.href='/login'; }
-document.querySelector('#add')?.addEventListener('submit',async e=>{e.preventDefault(); const b=Object.fromEntries(new FormData(e.target)); out(JSON.stringify(await fetch('/api/admin/articles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json()),null,2)); e.target.reset(); load();});
+document.querySelector('#add')?.addEventListener('submit',async e=>{e.preventDefault(); const b=Object.fromEntries(new FormData(e.target)); b.is_pinned=!!b.is_pinned; out(JSON.stringify(await fetch('/api/admin/articles',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json()),null,2)); e.target.reset(); load();});
+document.querySelector('#userForm')?.addEventListener('submit',async e=>{e.preventDefault(); const b=Object.fromEntries(new FormData(e.target)); b.is_admin=!!b.is_admin; out(JSON.stringify(await fetch('/api/admin/users',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json()),null,2)); e.target.reset(); load();});
+document.querySelector('#codeForm')?.addEventListener('submit',async e=>{e.preventDefault(); const b=Object.fromEntries(new FormData(e.target)); b.is_admin=!!b.is_admin; out(JSON.stringify(await fetch('/api/admin/login-codes',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json()),null,2)); e.target.reset(); load();});
 function out(s){document.querySelector('#out').textContent=s} function esc(s){return String(s||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))} boot();
 </script>`; }
 
-function loginPage() { return authShell('Login', '/api/login', 'Log in', 'Need an account? <a href="/signup">Sign up</a>'); }
-function signupPage() { return authShell('Sign up', '/api/signup', 'Create account', 'Already have one? <a href="/login">Log in</a>'); }
+function loginPage() { return authShell('Login', '/api/login', 'Log in', 'Need an account? <a href="/signup">Sign up</a> · Have a code? <a href="/code-login">Use code</a>'); }
+function signupPage() { return authShell('Sign up', '/api/signup', 'Create account', 'Already have one? <a href="/login">Log in</a> · Have a code? <a href="/code-login">Use code</a>'); }
+function codeLoginPage() { return `<section class="authbox"><h1>Code login</h1><form id="f"><input name="email" type="email" placeholder="Email" required><input name="code" placeholder="Login code" required><button>Log in with code</button></form><p>Have a password? <a href="/login">Log in</a></p><pre id="out"></pre></section><script>f.onsubmit=async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(f));const r=await fetch('/api/code-login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});const j=await r.json(); if(r.ok) location.href=j.is_admin?'/admin':'/'; else out.textContent=j.error||'Error';}</script>`; }
 function authShell(title, endpoint, button, foot) { return `<section class="authbox"><h1>${title}</h1><form id="f"><input name="email" type="email" placeholder="Email" required><input name="password" type="password" placeholder="Password" minlength="8" required><button>${button}</button></form><p>${foot}</p><pre id="out"></pre></section><script>f.onsubmit=async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(f));const r=await fetch('${endpoint}',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});const j=await r.json(); if(r.ok) location.href=j.is_admin?'/admin':'/'; else out.textContent=j.error||'Error';}</script>`; }
 function subscribePage() { return `<section class="authbox"><h1>Email updates</h1><p>Pick categories and get a daily digest.</p><form id="f"><input name="email" type="email" placeholder="Email" required><div class="checks">${CATEGORIES.map(c=>`<label><input type="checkbox" name="categories" value="${c}" checked> ${c}</label>`).join('')}</div><button>Subscribe</button></form><pre id="out"></pre></section><script>f.onsubmit=async e=>{e.preventDefault();const fd=new FormData(f);const b={email:fd.get('email'),categories:fd.getAll('categories')};const r=await fetch('/api/subscribe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)});out.textContent=r.ok?'Subscribed. Nice.':(await r.text())}</script>`; }
 
-function html(body, env) { return new Response(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtmlServer(env.SITE_NAME || 'Gaband News')}</title><style>${css()}</style></head><body><nav><a class="brand" href="/">${escapeHtmlServer(env.SITE_NAME || 'Gaband News')}</a><div><a href="/subscribe">Subscribe</a><a href="/admin">Admin</a></div></nav>${body}</body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } }); }
-function css(){return `:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#eef2ff;background:#09090b}body{margin:0;background:radial-gradient(circle at top left,#1f2937,#09090b 45%);min-height:100vh}nav{display:flex;justify-content:space-between;align-items:center;padding:18px 6vw;position:sticky;top:0;backdrop-filter:blur(14px);background:#09090bbd;border-bottom:1px solid #ffffff14;z-index:4}a{color:inherit}nav a{text-decoration:none;margin-left:16px}.brand{font-weight:900;margin-left:0}.hero{padding:70px 6vw 45px}.hero.small{padding:38px 6vw}.hero h1{font-size:clamp(42px,8vw,86px);line-height:.92;margin:0 0 18px}.hero p{color:#cbd5e1;font-size:18px;max-width:760px}.eyebrow{color:#93c5fd!important;text-transform:uppercase;letter-spacing:.16em;font-size:13px!important}.actions{display:flex;gap:12px;flex-wrap:wrap}.actions a,button{background:#60a5fa;color:#020617;border:0;border-radius:14px;padding:12px 16px;font-weight:800;text-decoration:none;cursor:pointer}.actions .secondary,button.secondary{background:#27272a;color:#fff}.toolbar{display:flex;gap:12px;padding:0 6vw 22px}input,select,textarea{width:100%;box-sizing:border-box;border:1px solid #ffffff1c;background:#111827;color:#fff;border-radius:14px;padding:13px}textarea{min-height:100px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:18px;padding:0 6vw 50px}.card,.panel,.authbox,.row{background:#0f172acc;border:1px solid #ffffff17;border-radius:24px;box-shadow:0 20px 70px #0008}.card{overflow:hidden}.card img{width:100%;height:180px;object-fit:cover;background:#111}.card div{padding:18px}.card h2{font-size:19px;line-height:1.2}.card p,.muted,footer{color:#cbd5e1}.pill{background:#1d4ed8;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:800}.topics{padding:0 6vw 18px;display:flex;gap:8px;flex-wrap:wrap}.topics button{background:#1f2937;color:#dbeafe;padding:8px 11px}.authbox{max-width:430px;margin:60px auto;padding:28px}.authbox h1{font-size:38px;margin-top:0}.panel{padding:22px;margin:20px 6vw}.admin{padding-bottom:60px}.hidden{display:none}.list{padding:0 6vw;display:grid;gap:12px}.row{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:14px 18px}.checks{display:grid;gap:8px;margin:14px 0}pre{white-space:pre-wrap;color:#bfdbfe}`}
-function digestHtml(env, articles){return `<div style="font-family:Arial,sans-serif;background:#f6f8fb;padding:24px"><div style="max-width:680px;margin:auto;background:white;border-radius:18px;padding:24px"><h1>${escapeHtmlServer(env.SITE_NAME || 'Gaband News')}</h1><p>Here are the latest stories.</p>${articles.map(a=>`<div style="border-top:1px solid #eee;padding:16px 0"><p style="font-size:12px;text-transform:uppercase;color:#2563eb;font-weight:bold">${escapeHtmlServer(a.category)}</p><h2><a href="${escapeHtmlServer(a.url)}">${escapeHtmlServer(a.title)}</a></h2><p>${escapeHtmlServer(a.description||'')}</p><small>${escapeHtmlServer(a.source||'')}</small></div>`).join('')}</div></div>`}
+function html(body, env) { return new Response(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escapeHtmlServer(env.SITE_NAME || DEFAULT_SITE_NAME)}</title><style>${css()}</style></head><body><nav><a class="brand" href="/">${escapeHtmlServer(env.SITE_NAME || DEFAULT_SITE_NAME)}</a><div><a href="/subscribe">Subscribe</a><a href="/admin">Admin</a></div></nav>${body}</body></html>`, { headers: { 'Content-Type': 'text/html; charset=utf-8' } }); }
+function css(){return `:root{font-family:Inter,ui-sans-serif,system-ui,sans-serif;color:#eef2ff;background:#09090b}body{margin:0;background:radial-gradient(circle at top left,#1f2937,#09090b 45%);min-height:100vh}nav{display:flex;justify-content:space-between;align-items:center;padding:18px 6vw;position:sticky;top:0;backdrop-filter:blur(14px);background:#09090bbd;border-bottom:1px solid #ffffff14;z-index:4}a{color:inherit}nav a{text-decoration:none;margin-left:16px}.brand{font-weight:900;margin-left:0}.hero{padding:70px 6vw 45px}.hero.small{padding:38px 6vw}.hero h1{font-size:clamp(42px,8vw,86px);line-height:.92;margin:0 0 18px}.hero p{color:#cbd5e1;font-size:18px;max-width:760px}.eyebrow{color:#93c5fd!important;text-transform:uppercase;letter-spacing:.16em;font-size:13px!important}.actions{display:flex;gap:12px;flex-wrap:wrap}.actions a,button{background:#60a5fa;color:#020617;border:0;border-radius:14px;padding:12px 16px;font-weight:800;text-decoration:none;cursor:pointer}.actions .secondary,button.secondary{background:#27272a;color:#fff}.toolbar{display:flex;gap:12px;padding:0 6vw 22px}input,select,textarea{width:100%;box-sizing:border-box;border:1px solid #ffffff1c;background:#111827;color:#fff;border-radius:14px;padding:13px;margin:6px 0}textarea{min-height:100px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:18px;padding:0 6vw 50px}.card,.panel,.authbox,.row{background:#0f172acc;border:1px solid #ffffff17;border-radius:24px;box-shadow:0 20px 70px #0008}.card{overflow:hidden}.card img{width:100%;height:180px;object-fit:cover;background:#111}.card div{padding:18px}.card h2{font-size:19px;line-height:1.2}.card p,.muted,footer{color:#cbd5e1}.pill{background:#1d4ed8;padding:5px 9px;border-radius:999px;font-size:12px;font-weight:800}.topics{padding:0 6vw 18px;display:flex;gap:8px;flex-wrap:wrap}.topics button{background:#1f2937;color:#dbeafe;padding:8px 11px}.authbox{max-width:430px;margin:60px auto;padding:28px}.authbox h1{font-size:38px;margin-top:0}.panel{padding:22px;margin:20px 6vw}.admin{padding-bottom:60px}.hidden{display:none}.list{padding:0 6vw;display:grid;gap:12px}.row{display:flex;justify-content:space-between;gap:12px;align-items:center;padding:14px 18px}.checks{display:grid;gap:8px;margin:14px 0}.article-page{max-width:820px;margin:42px auto;padding:28px;background:#0f172acc;border:1px solid #ffffff17;border-radius:28px}.article-page h1{font-size:clamp(34px,7vw,68px);line-height:1;margin:16px 0}.article-hero{width:100%;max-height:420px;object-fit:cover;border-radius:22px;margin-bottom:18px}.lede{font-size:20px;color:#e5e7eb}.compact{padding:0;gap:10px}pre{white-space:pre-wrap;color:#bfdbfe}`}
+function digestHtml(env, articles){return `<div style="font-family:Arial,sans-serif;background:#f6f8fb;padding:24px"><div style="max-width:680px;margin:auto;background:white;border-radius:18px;padding:24px"><h1>${escapeHtmlServer(env.SITE_NAME || DEFAULT_SITE_NAME)}</h1><p>Here are the latest stories.</p>${articles.map(a=>`<div style="border-top:1px solid #eee;padding:16px 0"><p style="font-size:12px;text-transform:uppercase;color:#2563eb;font-weight:bold">${escapeHtmlServer(a.category)}</p><h2><a href="${escapeHtmlServer((env.SITE_ORIGIN || '').replace(/\/$/,'') + '/article/' + a.id)}">${escapeHtmlServer(a.title)}</a></h2><p>${escapeHtmlServer(a.description||'')}</p><small>${escapeHtmlServer(a.source||'')}</small></div>`).join('')}</div></div>`}
+
+async function ensurePresetAdmin(env){
+  const email = normalizeEmail(env.ADMIN_PRESET_EMAIL || splitEnv(env.ADMIN_EMAILS || '')[0] || '');
+  const password = String(env.ADMIN_PRESET_PASSWORD || '');
+  if (!email || password.length < 8) return;
+  const existing = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
+  const passwordHash = await hashPassword(password);
+  if (existing) await env.DB.prepare(`UPDATE users SET password_hash = ?, is_admin = 1 WHERE email = ?`).bind(passwordHash, email).run();
+  else await env.DB.prepare(`INSERT INTO users(email, password_hash, is_admin) VALUES(?, ?, 1)`).bind(email, passwordHash).run();
+}
+function makeLoginCode(){ return 'G323-' + Math.random().toString(36).slice(2,6).toUpperCase() + '-' + Math.random().toString(36).slice(2,6).toUpperCase(); }
 
 async function requireSession(request, env, mustAdmin = false) { const raw = getCookie(request, 'gn_session'); if (!raw) throw httpError('Not logged in', 401); const session = await verifySession(raw, env); if (!session) throw httpError('Bad session', 401); if (mustAdmin && !session.is_admin) throw httpError('Admin required', 403); return session; }
 function getCookie(request, name){ const c=request.headers.get('cookie')||''; return c.split(';').map(x=>x.trim()).find(x=>x.startsWith(name+'='))?.slice(name.length+1); }
