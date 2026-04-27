@@ -965,23 +965,32 @@ async function sendDigest(env) {
 }
 
 async function ensurePresetAdmin(env) {
-  if (!env.ADMIN_PRESET_EMAIL || !env.ADMIN_PRESET_PASSWORD) return;
+  try {
+    if (!env.DB) return;
+    if (!env.ADMIN_PRESET_EMAIL || !env.ADMIN_PRESET_PASSWORD) return;
 
-  const email = String(env.ADMIN_PRESET_EMAIL).trim().toLowerCase();
-  const existing = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
+    const email = String(env.ADMIN_PRESET_EMAIL).trim().toLowerCase();
+    const password = String(env.ADMIN_PRESET_PASSWORD);
 
-  if (existing) {
-    await env.DB.prepare(`UPDATE users SET role = 'admin' WHERE email = ?`).bind(email).run();
-    return;
+    if (!email || !password) return;
+
+    const existing = await env.DB.prepare(`SELECT id FROM users WHERE email = ?`).bind(email).first();
+
+    if (existing) {
+      await env.DB.prepare(`UPDATE users SET role = 'admin' WHERE email = ?`).bind(email).run();
+      return;
+    }
+
+    const hash = await hashPassword(password);
+
+    await env.DB.prepare(`
+      INSERT INTO users (id, email, password_hash, role)
+      VALUES (?, ?, ?, 'admin')
+    `).bind(crypto.randomUUID(), email, hash).run();
+  } catch (e) {
+    console.error("ensurePresetAdmin failed:", e && e.stack ? e.stack : e);
   }
-
-  const hash = await hashPassword(String(env.ADMIN_PRESET_PASSWORD));
-  await env.DB.prepare(`
-    INSERT INTO users (id, email, password_hash, role)
-    VALUES (?, ?, ?, 'admin')
-  `).bind(crypto.randomUUID(), email, hash).run();
 }
-
 async function requireAdmin(request, env) {
   const user = await getCurrentUser(request, env);
 
